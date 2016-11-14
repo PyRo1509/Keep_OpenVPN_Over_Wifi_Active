@@ -1,0 +1,168 @@
+#!/bin/bash
+OLDIFS=$IFS;
+IFS=$'\n';
+current_pid=$$;
+scriptname="$0";
+basescriptname=$(basename "$scriptname");
+
+debug_level=0;
+debug_location="/dev/tty";
+
+function Debug_Write(){
+        #Debug_Write 0 "message"
+        local l_set_debug_level=$1;
+        if [ $debug_level -le $l_set_debug_level ]; then
+                local l_from_function=${FUNCNAME[1]};
+                local l_debug_message=$2;
+                local time=`date +"%T"`;
+                echo -e "DEBUG[$l_set_debug_level] - $time: $l_from_function - $l_debug_message" >> "$debug_location";
+        fi
+}
+
+
+function Load_Config_File(){
+config_file_location="$(dirname $scriptname)/config.$basescriptname";
+Debug_Write 0 "Config file set as $config_file_location";
+if [ -a "$config_file_location" ]; then
+Debug_Write 0 "Loading configuration file: $config_file_location";
+source "$config_file_location";
+else
+local configuration_message="Configuration file not found at \"$config_file_location\", Creating it now."
+Debug_Write 100 "$configuration_message";
+echo "$configuration_message" >> /dev/tty;
+
+cat > "$config_file_location" << 'EOFEOFEOFEOF'
+remote_ip="" #Remote IP here
+wifi_ap="" #The IP address of the AP
+local_interface="wlan0"
+#Lower number are more verbose
+debug_level=4;
+#debug_location="$scriptname.$curent_pid.log";
+#debug_location="/var/log/${scriptname%%.sh}.log"; #Output to Normal Log Location
+#debug_location="/var/log/syslog #Output to syslog
+debug_location="/dev/tty"; #Output to Terminal
+EOFEOFEOFEOF
+
+Kill_Program;
+fi
+
+}
+
+function Kill_Program(){
+kill -s TERM $current_pid;
+}
+
+function Check_if_Connected_to_wifi() {
+	Debug_Write 3 "Testing if Connected to Wifi"
+	local a=$(ifconfig | grep "Bcast:${wifi_ap%.*}");
+	Debug_Write 0 "ifconfig | grep \"Bcast:${wifi_ap%.*}\" = $a"
+	if [ $a ]; then
+		Debug_Write 2 "Wireless interface connected with correct DHCP";
+		return 0;
+	else
+		Debug_Write 2 "Wireless interface NOT Connected";
+		return 1;
+	fi
+}
+
+function CheckInternet(){
+	Debug_Write 3 "Testing Connection to Google";
+	wget -q --timeout=5  --spider http://google.com
+	if [ $? -eq 0 ]; then
+		Debug_Write 2 "Connection to Google Succeeded";
+		return 0;
+	else
+		Debug_Write 2 "Connection to Google has Failed";
+		return 1;
+	fi
+}
+
+function Check_If_Route_is_Exceptioned(){
+	Debug_Write 3 "Checking if route to $remote_ip is exceptioned"
+	local a=$(ip route show|grep $remote_ip | grep $wifi_ap | grep $local_interface );
+	if [ $a ]; then
+		Debug_Write 2 "$remote_ip via $wifi_ap dev $local_interface - Found";
+		return 0;
+	else
+		Debug_Write 2 "$remote_ip via $wifi_ap dev $local_interface - NOT Found";
+		return 1;
+	fi
+}
+
+function Add_Route_Exception(){
+	Debug_Write 3 "Adding Exception: ip route add $remote_ip via $wifi_ap";
+	ip route add $remote_ip via $wifi_ap
+}
+
+function ResetWifi(){
+	Debug_Write 3 "Resetting Wifi";
+	Debug_Write 2  "Shutting Down $local_interface";
+	ifdown $local_interface;
+	Debug_Write 2  "Sleeping for 10 seconds before bringing wlan0 back up"
+	sleep 10;
+	Debug_Write 2  "Bringing up $local_interface";
+	ifup $local_interface;
+	Debug_Write 3 "Wifi Reset Complete";
+}
+
+function Check_If_Another_Instance_Is_Already_Running(){
+        Debug_Write 1 "Testing if another instance is currently running";
+        local a=$(ps -ef | grep bash | grep "$basescriptname" | grep -v "$current_pid" | grep -v "/bin/sh");
+        Debug_Write 0 "ps -ef | grep bash | grep \"$basescriptname\" | grep -v \"$current_pid\" | grep -v \"/bin/sh\" = $a"
+	if [ $a ]; then
+		Debug_Write 1 "Another instance of $basescriptname was found!"
+		Debug_Write 0 "Checking if log has PID in it. Deleting it if it does";
+		local b=$(echo $debug_location | grep "$current_pid.log")
+		if [ $b ]; then
+			rm $debug_location
+		fi
+		return 0;
+        else
+		Debug_Write 1 "No Other instance of $basescriptname was found."
+                return 1;
+        fi
+}
+
+function MAIN(){
+	local failed_connection_count=0;
+	Load_Config_File;
+	while ! Check_If_Another_Instance_Is_Already_Running; do
+		Debug_Write 3 "Checking if connection is active"
+		if CheckInternet; then
+			failed_connection_count=0;
+		else
+			failed_connection_count=$(( $failed_connection_count + 1));
+			Debug_Write 4 "Failed Connection Count is now at $failed_connection_count"
+		fi
+
+		if [ $failed_connection_count -gt 4 ]; then
+			Debug_Write 4 "Stopping OpenVPN"
+			service openvpn stop;
+
+			if ! Check_if_Connected_to_wifi; then
+				ResetWifi;
+				sleep 5;
+			fi
+
+			if ! Check_If_Route_is_Exceptioned; then
+				Add_Route_Exception;
+			fi
+			Debug_Write 4 "Starting OpenVPN"
+			service openvpn start;
+			Debug_Write 4 "Sleeping for 30 seconds to let OpenVPN stabalize";
+			sleep 30;
+		elif [ $failed_connection_count -gt 0 ]; then
+	                Debug_Write 4 "Sleeping for 10 seconds before next attempt"
+	                sleep 10;
+		elif [ $failed_connection_count -eq 0 ]; then
+			sleep 30;
+		fi
+	done
+}
+
+
+MAIN;
+
+echo '-=-=-=- END OF PROGRAM -=-=-=-'>/dev/tty;
+IFS=$OLDIFS
+exit 0
